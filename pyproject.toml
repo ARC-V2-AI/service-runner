@@ -1,0 +1,25 @@
+[project]
+name = "arc-v2-service-runner"
+version = "0.1.0"
+description = "ARC-V2 service contract and runtime runner"
+readme = "README.md"
+authors = [{ name = "PauWol", email = "paul22wof@proton.me" }]
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+arc-v2-service-runner = "arc_service.runner:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/arc_service"]
+
+[project.entry-points."arc.services"]
+service-runner = "arc_service.runner:ServiceRunner"
+
+[tool.arc.service]
+id = "service-runner"
+kind = "framework"
