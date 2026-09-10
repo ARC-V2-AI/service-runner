@@ -19,8 +19,8 @@ class ServiceInfo:
 class Service(ABC):
     def __init__(
         self,
-        name: str,
-        version: str,
+        name: str = "",
+        version: str = "",
         description: str = "",
     ) -> None:
         self.ctx: BaseContext

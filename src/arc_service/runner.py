@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import asyncio
 import importlib
 import inspect
@@ -13,8 +14,10 @@ from .context import BaseContext
 from .service import Service
 from .types import ProcessOutcome, ProcessResult, ServiceStatus
 
-_ControlConn: TypeAlias = Connection
-_ResultConn: TypeAlias = Connection
+ControlConnection: TypeAlias = Connection
+ResultConnection: TypeAlias = Connection
+
+logger = logging.getLogger(__name__)
 
 
 def resolve_service_class(
@@ -51,66 +54,83 @@ def make_context(service_name: str) -> BaseContext:
         logger=logging.getLogger(service_name),
         env=dict(os.environ),
         service_name=service_name,
-        process_name=__import__("multiprocessing").current_process().name,
+        process_name=(__import__("multiprocessing").current_process().name),
     )
 
 
-async def run_service(
-    service_class: type[Service],
-    service_name: str,
-    control_conn: _ControlConn,
-    result_conn: _ResultConn,
+def send_result(
+    result_conn: ResultConnection,
+    result: ProcessResult,
 ) -> None:
-    ctx = make_context(service_name)
-    service = service_class()
-
-    run_task = asyncio.create_task(service.start(ctx))
-
     try:
+        result_conn.send_bytes(result.to_bytes())
+    except (
+        BrokenPipeError,
+        ConnectionResetError,
+        OSError,
+    ):
+        pass
+
+
+async def run_service(
+    module_path: str,
+    service_name: str,
+    control_conn: ControlConnection,
+    result_conn: ResultConnection,
+) -> None:
+    try:
+        service_class = resolve_service_class(module_path)
+
+        service = service_class()
+        ctx = make_context(service_name)
+
+        run_task = asyncio.create_task(service.start(ctx))
+
         while True:
             if control_conn.poll():
-                command = control_conn.recv()
+                command = control_conn.recv_bytes()
 
-                if command == "status":
+                if command == b"status":
                     try:
                         ready, ready_reason = await service.ready()
                     except BaseException as exc:
-                        control_conn.send(
+                        control_conn.send_bytes(
                             ServiceStatus(
                                 ready=False,
-                                ready_reason=f"ready() failed: {exc}",
+                                ready_reason=(f"ready() failed: {exc}"),
                                 healthy=False,
                                 healthy_reason=None,
-                            )
+                            ).to_bytes()
                         )
                         continue
 
                     try:
                         healthy, healthy_reason = await service.healthy()
                     except BaseException as exc:
-                        control_conn.send(
+                        control_conn.send_bytes(
                             ServiceStatus(
                                 ready=ready,
                                 ready_reason=ready_reason,
                                 healthy=False,
-                                healthy_reason=f"healthy() failed: {exc}",
-                            )
+                                healthy_reason=(f"healthy() failed: {exc}"),
+                            ).to_bytes()
                         )
                         continue
 
-                    control_conn.send(
+                    control_conn.send_bytes(
                         ServiceStatus(
                             ready=ready,
                             ready_reason=ready_reason,
                             healthy=healthy,
                             healthy_reason=healthy_reason,
-                        )
+                        ).to_bytes()
                     )
 
-                elif command == "stop":
-                    await service.stop()
-
-                    run_task.cancel()
+                elif command == b"stop":
+                    try:
+                        await service.stop()
+                    finally:
+                        run_task.cancel()
 
                     try:
                         await run_task
@@ -125,31 +145,99 @@ async def run_service(
 
             await asyncio.sleep(0.1)
 
+        send_result(
+            result_conn,
+            ProcessResult(
+                outcome=ProcessOutcome.STOPPED,
+            ),
+        )
+
     except asyncio.CancelledError:
-        result_conn.send(
+        send_result(
+            result_conn,
             ProcessResult(
                 outcome=ProcessOutcome.CANCELLED,
-            )
+            ),
         )
         raise
 
     except BaseException as exc:
-        result_conn.send(
+        send_result(
+            result_conn,
             ProcessResult(
                 outcome=ProcessOutcome.CRASHED,
                 error=str(exc),
                 traceback=traceback.format_exc(),
-            )
+            ),
         )
-        raise
 
-    else:
-        result_conn.send(
-            ProcessResult(
-                outcome=ProcessOutcome.STOPPED,
-            )
+        logger.exception(
+            "Service '%s' crashed",
+            service_name,
         )
 
     finally:
         control_conn.close()
         result_conn.close()
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--module",
+        required=True,
+    )
+
+    parser.add_argument(
+        "--service-name",
+        required=True,
+    )
+
+    parser.add_argument(
+        "--control-fd",
+        required=True,
+        type=int,
+    )
+
+    parser.add_argument(
+        "--result-fd",
+        required=True,
+        type=int,
+    )
+
+    return parser.parse_args()
+
+
+def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format=("[%(asctime)s] %(levelname)s %(name)s: %(message)s"),
+    )
+
+    args = parse_args()
+
+    control_conn = Connection(
+        args.control_fd,
+        readable=True,
+        writable=True,
+    )
+
+    result_conn = Connection(
+        args.result_fd,
+        readable=False,
+        writable=True,
+    )
+
+    asyncio.run(
+        run_service(
+            module_path=args.module,
+            service_name=args.service_name,
+            control_conn=control_conn,
+            result_conn=result_conn,
+        )
+    )
+
+
+if __name__ == "__main__":
+    main()

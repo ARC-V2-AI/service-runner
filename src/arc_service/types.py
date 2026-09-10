@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from enum import StrEnum
 from typing import Any
 
@@ -9,13 +9,12 @@ from typing import Any
 class ServiceState(StrEnum):
     NONE = "none"
     REGISTERED = "registered"
-    CREATED = "created"
     STARTING = "starting"
     READY = "ready"
     RUNNING = "running"
+    FAILED = "failed"
     STOPPING = "stopping"
     STOPPED = "stopped"
-    FAILED = "failed"
 
 
 class ProcessOutcome(StrEnum):
@@ -24,7 +23,7 @@ class ProcessOutcome(StrEnum):
     CANCELLED = "cancelled"
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class ServiceStatus:
     ready: bool
     ready_reason: str | None
@@ -33,55 +32,35 @@ class ServiceStatus:
 
     def to_bytes(self) -> bytes:
         return json.dumps(
-            {
-                "ready": self.ready,
-                "ready_reason": self.ready_reason,
-                "healthy": self.healthy,
-                "healthy_reason": self.healthy_reason,
-            },
+            asdict(self),
             separators=(",", ":"),
         ).encode("utf-8")
 
     @classmethod
-    def from_bytes(cls, data: bytes) -> ServiceStatus:
-        value: Any = json.loads(data)
-
-        if not isinstance(value, dict):
-            raise ValueError("Invalid ServiceStatus payload")
-
-        return cls(
-            ready=bool(value["ready"]),
-            ready_reason=value.get("ready_reason"),
-            healthy=bool(value["healthy"]),
-            healthy_reason=value.get("healthy_reason"),
-        )
+    def from_bytes(cls, data: bytes) -> "ServiceStatus":
+        values: dict[str, Any] = json.loads(data.decode("utf-8"))
+        return cls(**values)
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class ProcessResult:
     outcome: ProcessOutcome
     error: str | None = None
     traceback: str | None = None
 
     def to_bytes(self) -> bytes:
+        data = asdict(self)
+        data["outcome"] = self.outcome.value
+
         return json.dumps(
-            {
-                "outcome": self.outcome.value,
-                "error": self.error,
-                "traceback": self.traceback,
-            },
+            data,
             separators=(",", ":"),
         ).encode("utf-8")
 
     @classmethod
-    def from_bytes(cls, data: bytes) -> ProcessResult:
-        value: Any = json.loads(data)
+    def from_bytes(cls, data: bytes) -> "ProcessResult":
+        values: dict[str, Any] = json.loads(data.decode("utf-8"))
 
-        if not isinstance(value, dict):
-            raise ValueError("Invalid ProcessResult payload")
+        values["outcome"] = ProcessOutcome(values["outcome"])
 
-        return cls(
-            outcome=ProcessOutcome(value["outcome"]),
-            error=value.get("error"),
-            traceback=value.get("traceback"),
-        )
+        return cls(**values)
