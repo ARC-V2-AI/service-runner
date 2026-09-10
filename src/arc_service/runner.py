@@ -5,17 +5,14 @@ import asyncio
 import importlib
 import inspect
 import logging
+import multiprocessing
 import os
 import traceback
 from multiprocessing.connection import Connection
-from typing import TypeAlias
 
 from .context import BaseContext
 from .service import Service
 from .types import ProcessOutcome, ProcessResult, ServiceStatus
-
-ControlConnection: TypeAlias = Connection
-ResultConnection: TypeAlias = Connection
 
 logger = logging.getLogger(__name__)
 
@@ -49,17 +46,19 @@ def resolve_service_class(
     raise TypeError(f"No Service subclass found in '{module_path}'")
 
 
-def make_context(service_name: str) -> BaseContext:
+def make_context(
+    service_name: str,
+) -> BaseContext:
     return BaseContext(
         logger=logging.getLogger(service_name),
         env=dict(os.environ),
         service_name=service_name,
-        process_name=(__import__("multiprocessing").current_process().name),
+        process_name=(multiprocessing.current_process().name),
     )
 
 
 def send_result(
-    result_conn: ResultConnection,
+    result_conn: Connection,
     result: ProcessResult,
 ) -> None:
     try:
@@ -75,13 +74,16 @@ def send_result(
 async def run_service(
     module_path: str,
     service_name: str,
-    control_conn: ControlConnection,
-    result_conn: ResultConnection,
+    control_conn: Connection,
+    result_conn: Connection,
 ) -> None:
+    run_task: asyncio.Task[None] | None = None
+
     try:
         service_class = resolve_service_class(module_path)
 
         service = service_class()
+
         ctx = make_context(service_name)
 
         run_task = asyncio.create_task(service.start(ctx))
@@ -127,19 +129,19 @@ async def run_service(
                     )
 
                 elif command == b"stop":
-                    try:
-                        await service.stop()
-                    finally:
+                    await service.stop()
+
+                    if run_task is not None:
                         run_task.cancel()
 
-                    try:
-                        await run_task
-                    except asyncio.CancelledError:
-                        pass
+                        try:
+                            await run_task
+                        except asyncio.CancelledError:
+                            pass
 
                     break
 
-            if run_task.done():
+            if run_task is not None and run_task.done():
                 await run_task
                 break
 
@@ -175,6 +177,9 @@ async def run_service(
             "Service '%s' crashed",
             service_name,
         )
+
+        # Do not re-raise here. The result has been reported
+        # and the process should exit normally after reporting it.
 
     finally:
         control_conn.close()
