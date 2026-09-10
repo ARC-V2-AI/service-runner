@@ -10,9 +10,10 @@ import os
 import traceback
 from multiprocessing.connection import Connection
 
-from .context import BaseContext
-from .service import Service
-from .types import ProcessOutcome, ProcessResult, ServiceStatus
+from arc_service.context import BaseContext
+from arc_service.logger import configure_logging
+from arc_service.service import Service
+from arc_service.types import ProcessOutcome, ProcessResult, ServiceStatus
 
 logger = logging.getLogger(__name__)
 
@@ -215,10 +216,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format=("[%(asctime)s] %(levelname)s %(name)s: %(message)s"),
-    )
+    configure_logging()
 
     args = parse_args()
 

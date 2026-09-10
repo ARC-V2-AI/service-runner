@@ -1,6 +1,6 @@
 [project]
 name = "arc-v2-service-runner"
-version = "0.1.2"
+version = "0.1.3"
 description = "ARC-V2 service contract and runtime runner"
 readme = "README.md"
 authors = [{ name = "PauWol", email = "paul22wof@proton.me" }]
