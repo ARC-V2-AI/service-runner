@@ -31,10 +31,7 @@ class ServiceStatus:
     healthy_reason: str | None
 
     def to_bytes(self) -> bytes:
-        return json.dumps(
-            asdict(self),
-            separators=(",", ":"),
-        ).encode("utf-8")
+        return json.dumps(asdict(self), separators=(",", ":")).encode("utf-8")
 
     @classmethod
     def from_bytes(cls, data: bytes) -> "ServiceStatus":
@@ -51,16 +48,10 @@ class ProcessResult:
     def to_bytes(self) -> bytes:
         data = asdict(self)
         data["outcome"] = self.outcome.value
-
-        return json.dumps(
-            data,
-            separators=(",", ":"),
-        ).encode("utf-8")
+        return json.dumps(data, separators=(",", ":")).encode("utf-8")
 
     @classmethod
     def from_bytes(cls, data: bytes) -> "ProcessResult":
         values: dict[str, Any] = json.loads(data.decode("utf-8"))
-
         values["outcome"] = ProcessOutcome(values["outcome"])
-
         return cls(**values)

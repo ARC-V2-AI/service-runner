@@ -10,6 +10,7 @@ import os
 import traceback
 from multiprocessing.connection import Connection
 
+from arc_service.communication import CommunicationClient, discover_bindings
 from arc_service.context import BaseContext
 from arc_service.logger import configure_logging
 from arc_service.service import Service
@@ -35,7 +36,6 @@ def resolve_service_class(
             raise TypeError(f"'{module_path}:{class_name}' is not a Service subclass")
 
         return target
-
     for target in vars(module).values():
         if (
             inspect.isclass(target)
@@ -49,12 +49,14 @@ def resolve_service_class(
 
 def make_context(
     service_name: str,
+    communication: CommunicationClient | None = None,
 ) -> BaseContext:
     return BaseContext(
         logger=logging.getLogger(service_name),
         env=dict(os.environ),
         service_name=service_name,
-        process_name=(multiprocessing.current_process().name),
+        process_name=multiprocessing.current_process().name,
+        communication=communication,
     )
 
 
@@ -79,20 +81,31 @@ async def run_service(
     result_conn: Connection,
 ) -> None:
     run_task: asyncio.Task[None] | None = None
+    communication: CommunicationClient | None = None
 
     try:
         service_class = resolve_service_class(module_path)
-
         service = service_class()
+        rpc_bindings, event_bindings = discover_bindings(service)
 
-        ctx = make_context(service_name)
+        communication = CommunicationClient(
+            service_id=service_name,
+            logger=logging.getLogger(f"{service_name}.communication"),
+            rpc_bindings=rpc_bindings,
+            event_bindings=event_bindings,
+        )
+        await communication.connect()
+        ctx = make_context(service_name, communication)
 
         run_task = asyncio.create_task(service.start(ctx))
+        # Give Service.start()/run() an event-loop turn to install context and
+        # initialize synchronous state before the broker begins event delivery.
+        await asyncio.sleep(0)
+        await communication.activate()
 
         while True:
             if control_conn.poll():
                 command = control_conn.recv_bytes()
-
                 if command == b"status":
                     try:
                         ready, ready_reason = await service.ready()
@@ -100,13 +113,12 @@ async def run_service(
                         control_conn.send_bytes(
                             ServiceStatus(
                                 ready=False,
-                                ready_reason=(f"ready() failed: {exc}"),
+                                ready_reason=f"ready() failed: {exc}",
                                 healthy=False,
                                 healthy_reason=None,
                             ).to_bytes()
                         )
                         continue
-
                     try:
                         healthy, healthy_reason = await service.healthy()
                     except BaseException as exc:
@@ -115,11 +127,10 @@ async def run_service(
                                 ready=ready,
                                 ready_reason=ready_reason,
                                 healthy=False,
-                                healthy_reason=(f"healthy() failed: {exc}"),
+                                healthy_reason=f"healthy() failed: {exc}",
                             ).to_bytes()
                         )
                         continue
-
                     control_conn.send_bytes(
                         ServiceStatus(
                             ready=ready,
@@ -131,15 +142,12 @@ async def run_service(
 
                 elif command == b"stop":
                     await service.stop()
-
                     if run_task is not None:
                         run_task.cancel()
-
                         try:
                             await run_task
                         except asyncio.CancelledError:
                             pass
-
                     break
 
             if run_task is not None and run_task.done():
@@ -150,20 +158,15 @@ async def run_service(
 
         send_result(
             result_conn,
-            ProcessResult(
-                outcome=ProcessOutcome.STOPPED,
-            ),
+            ProcessResult(outcome=ProcessOutcome.STOPPED),
         )
 
     except asyncio.CancelledError:
         send_result(
             result_conn,
-            ProcessResult(
-                outcome=ProcessOutcome.CANCELLED,
-            ),
+            ProcessResult(outcome=ProcessOutcome.CANCELLED),
         )
         raise
-
     except BaseException as exc:
         send_result(
             result_conn,
@@ -173,65 +176,28 @@ async def run_service(
                 traceback=traceback.format_exc(),
             ),
         )
-
-        logger.exception(
-            "Service '%s' crashed",
-            service_name,
-        )
-
-        # Do not re-raise here. The result has been reported
-        # and the process should exit normally after reporting it.
-
+        logger.exception("Service '%s' crashed", service_name)
     finally:
+        if communication is not None:
+            await communication.close()
         control_conn.close()
         result_conn.close()
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-
-    parser.add_argument(
-        "--module",
-        required=True,
-    )
-
-    parser.add_argument(
-        "--service-name",
-        required=True,
-    )
-
-    parser.add_argument(
-        "--control-fd",
-        required=True,
-        type=int,
-    )
-
-    parser.add_argument(
-        "--result-fd",
-        required=True,
-        type=int,
-    )
-
+    parser.add_argument("--module", required=True)
+    parser.add_argument("--service-name", required=True)
+    parser.add_argument("--control-fd", required=True, type=int)
+    parser.add_argument("--result-fd", required=True, type=int)
     return parser.parse_args()
 
 
 def main() -> None:
     configure_logging()
-
     args = parse_args()
-
-    control_conn = Connection(
-        args.control_fd,
-        readable=True,
-        writable=True,
-    )
-
-    result_conn = Connection(
-        args.result_fd,
-        readable=False,
-        writable=True,
-    )
-
+    control_conn = Connection(args.control_fd, readable=True, writable=True)
+    result_conn = Connection(args.result_fd, readable=False, writable=True)
     asyncio.run(
         run_service(
             module_path=args.module,

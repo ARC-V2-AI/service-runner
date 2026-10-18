@@ -1,3 +1,20 @@
+from .communication import (
+    CommunicationClient,
+    CommunicationError,
+    CommunicationUnavailableError,
+    EventEnvelope,
+    EventBus,
+    EventQueueFullError,
+    ProtocolError,
+    PublishReceipt,
+    RemoteCallError,
+    RpcTimeoutError,
+    ServiceDirectory,
+    ServiceSummary,
+    ServiceUnavailableError,
+    event_handler,
+    rpc_method,
+)
 from .context import BaseContext
 from .service import Service, ServiceInfo
 from .types import (
@@ -9,10 +26,25 @@ from .types import (
 
 __all__ = [
     "BaseContext",
+    "CommunicationClient",
+    "CommunicationError",
+    "CommunicationUnavailableError",
+    "EventBus",
+    "EventEnvelope",
+    "EventQueueFullError",
     "ProcessOutcome",
     "ProcessResult",
+    "ProtocolError",
+    "PublishReceipt",
+    "RemoteCallError",
+    "RpcTimeoutError",
     "Service",
+    "ServiceDirectory",
     "ServiceInfo",
     "ServiceState",
     "ServiceStatus",
+    "ServiceSummary",
+    "ServiceUnavailableError",
+    "event_handler",
+    "rpc_method",
 ]
