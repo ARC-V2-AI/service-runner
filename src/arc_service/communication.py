@@ -13,13 +13,14 @@ import logging
 import os
 import re
 import uuid
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from collections.abc import AsyncIterable, AsyncIterator, Callable, Mapping
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Generic, Literal, TypeVar
+from types import UnionType
+from typing import Annotated, Any, Generic, Literal, TypeVar, Union, get_args, get_origin
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
 PROTOCOL_VERSION = 1
 MAX_FRAME_BYTES = 8 * 1024 * 1024
@@ -29,6 +30,28 @@ _SERVICE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
 _EVENT_TYPE_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$")
 
 PayloadT = TypeVar("PayloadT", bound=BaseModel)
+StreamEventT = TypeVar("StreamEventT")
+DEFAULT_STREAM_IDLE_TIMEOUT = 60.0
+
+
+def _is_model_event_type(annotation: Any) -> bool:
+    origin = get_origin(annotation)
+    if origin is Annotated:
+        args = get_args(annotation)
+        return bool(args) and _is_model_event_type(args[0])
+    if origin in (Union, UnionType):
+        args = get_args(annotation)
+        return bool(args) and all(_is_model_event_type(arg) for arg in args)
+    try:
+        return isinstance(annotation, type) and issubclass(annotation, BaseModel)
+    except TypeError:
+        return False
+
+
+def _event_type_adapter(annotation: Any) -> TypeAdapter:
+    if not _is_model_event_type(annotation):
+        raise TypeError("RPC stream events must be Pydantic models or unions of Pydantic models")
+    return TypeAdapter(annotation)
 
 
 class CommunicationError(RuntimeError):
@@ -105,6 +128,41 @@ class RpcResult(WireModel):
     payload: Any = None
     error: str | None = None
     error_type: str | None = None
+
+
+class RpcStreamCall(WireModel):
+    type: Literal["rpc_stream_call"] = "rpc_stream_call"
+    id: str
+    target: str = Field(pattern=_SERVICE_ID_RE.pattern)
+    method: str = Field(pattern=r"^[A-Za-z_][A-Za-z0-9_]*$")
+    payload: Any
+
+
+class RpcStreamRequest(WireModel):
+    type: Literal["rpc_stream_request"] = "rpc_stream_request"
+    id: str
+    caller: str
+    method: str
+    payload: Any
+
+
+class RpcStreamItem(WireModel):
+    type: Literal["rpc_stream_item"] = "rpc_stream_item"
+    id: str
+    payload: Any
+
+
+class RpcStreamEnd(WireModel):
+    type: Literal["rpc_stream_end"] = "rpc_stream_end"
+    id: str
+    ok: bool
+    error: str | None = None
+    error_type: str | None = None
+
+
+class RpcStreamCancel(WireModel):
+    type: Literal["rpc_stream_cancel"] = "rpc_stream_cancel"
+    id: str
 
 
 class Publish(WireModel):
@@ -190,6 +248,18 @@ class ServiceSummary(BaseModel):
     subscriptions: list[str] = Field(default_factory=list)
 
 
+@dataclass(slots=True)
+class _PendingStream:
+    queue: asyncio.Queue[Any] = field(default_factory=asyncio.Queue)
+
+
+@dataclass(frozen=True, slots=True)
+class _StreamFinished:
+    ok: bool
+    error: str | None = None
+    error_type: str | None = None
+
+
 @dataclass(frozen=True, slots=True)
 class RpcSpec:
     request_model: type[BaseModel]
@@ -208,6 +278,21 @@ class RpcBinding:
     name: str
     request_model: type[BaseModel]
     response_model: type[BaseModel]
+    handler: Callable[[BaseModel], Any]
+
+
+@dataclass(frozen=True, slots=True)
+class RpcStreamSpec:
+    request_model: type[BaseModel]
+    event_adapter: TypeAdapter
+    name: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RpcStreamBinding:
+    name: str
+    request_model: type[BaseModel]
+    event_adapter: TypeAdapter
     handler: Callable[[BaseModel], Any]
 
 
@@ -245,6 +330,31 @@ def rpc_method(
     return decorate
 
 
+
+def rpc_stream(
+    *,
+    request: type[BaseModel],
+    event: Any,
+    name: str | None = None,
+) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """Expose a service method as a typed, cancellable streaming RPC.
+
+    ``event`` may be a model or a union such as ``StreamEvent | AgentEvent``.
+    The decorated method must return an AsyncIterable of those models.
+    """
+    if not issubclass(request, BaseModel):
+        raise TypeError("RPC stream request type must be a Pydantic BaseModel class")
+    adapter = _event_type_adapter(event)
+    if name is not None and not name.isidentifier():
+        raise ValueError("RPC stream method name must be a Python identifier")
+
+    def decorate(function: Callable[..., Any]) -> Callable[..., Any]:
+        setattr(function, "__arc_rpc_stream_spec__", RpcStreamSpec(request, adapter, name))
+        return function
+
+    return decorate
+
+
 def event_handler(
     event_type: str,
     *,
@@ -269,9 +379,14 @@ def event_handler(
 
 def discover_bindings(
     service: object,
-) -> tuple[dict[str, RpcBinding], dict[str, EventBinding]]:
-    """Find RPC and event methods declared by decorators on a Service instance."""
+) -> tuple[
+    dict[str, RpcBinding],
+    dict[str, RpcStreamBinding],
+    dict[str, EventBinding],
+]:
+    """Find request/response RPC, streaming RPC, and event handlers."""
     rpc_bindings: dict[str, RpcBinding] = {}
+    stream_bindings: dict[str, RpcStreamBinding] = {}
     event_bindings: dict[str, EventBinding] = {}
 
     for attribute_name in dir(type(service)):
@@ -285,12 +400,26 @@ def discover_bindings(
         rpc_spec: RpcSpec | None = getattr(function, "__arc_rpc_spec__", None)
         if rpc_spec is not None:
             method_name = rpc_spec.name or attribute_name
-            if method_name in rpc_bindings:
+            if method_name in rpc_bindings or method_name in stream_bindings:
                 raise ValueError(f"Duplicate RPC method name: {method_name}")
             rpc_bindings[method_name] = RpcBinding(
                 name=method_name,
                 request_model=rpc_spec.request_model,
                 response_model=rpc_spec.response_model,
+                handler=bound,
+            )
+
+        stream_spec: RpcStreamSpec | None = getattr(
+            function, "__arc_rpc_stream_spec__", None
+        )
+        if stream_spec is not None:
+            method_name = stream_spec.name or attribute_name
+            if method_name in rpc_bindings or method_name in stream_bindings:
+                raise ValueError(f"Duplicate RPC method name: {method_name}")
+            stream_bindings[method_name] = RpcStreamBinding(
+                name=method_name,
+                request_model=stream_spec.request_model,
+                event_adapter=stream_spec.event_adapter,
                 handler=bound,
             )
 
@@ -307,7 +436,7 @@ def discover_bindings(
                 handler=bound,
             )
 
-    return rpc_bindings, event_bindings
+    return rpc_bindings, stream_bindings, event_bindings
 
 
 class ServiceDirectory:
@@ -356,6 +485,45 @@ class ServiceDirectory:
             raise ProtocolError(
                 f"Invalid response from service {service_id!r}, method {method!r}: {exc}"
             ) from exc
+
+    async def stream(
+        self,
+        service_id: str,
+        method: str,
+        request: BaseModel,
+        *,
+        event_model: Any,
+        idle_timeout: float | None = DEFAULT_STREAM_IDLE_TIMEOUT,
+    ) -> AsyncIterator[StreamEventT]:
+        """Yield typed events from a remote RPC stream.
+
+        ``idle_timeout`` limits the wait between consecutive frames, not the
+        total duration of the stream. Pass ``None`` to disable the idle timeout.
+        """
+        if not isinstance(request, BaseModel):
+            raise TypeError("RPC stream requests must be Pydantic BaseModel instances")
+        if not _SERVICE_ID_RE.fullmatch(service_id):
+            raise ValueError(f"Invalid service ID: {service_id!r}")
+        if not method.isidentifier():
+            raise ValueError(f"Invalid RPC stream method name: {method!r}")
+        if idle_timeout is not None and idle_timeout <= 0:
+            raise ValueError("idle_timeout must be greater than zero or None")
+
+        adapter = _event_type_adapter(event_model)
+        stream = self._client._stream(
+            service_id, method, request, idle_timeout=idle_timeout
+        )
+        try:
+            async for payload in stream:
+                try:
+                    yield adapter.validate_python(payload)
+                except Exception as exc:
+                    raise ProtocolError(
+                        f"Invalid stream event from service {service_id!r}, "
+                        f"method {method!r}: {exc}"
+                    ) from exc
+        finally:
+            await stream.aclose()
 
     async def list(
         self, *, timeout: float = DEFAULT_CALL_TIMEOUT
@@ -416,6 +584,7 @@ class CommunicationClient:
         *,
         logger: logging.Logger | None = None,
         rpc_bindings: Mapping[str, RpcBinding] | None = None,
+        stream_bindings: Mapping[str, RpcStreamBinding] | None = None,
         event_bindings: Mapping[str, EventBinding] | None = None,
     ) -> None:
         if not _SERVICE_ID_RE.fullmatch(service_id):
@@ -431,6 +600,7 @@ class CommunicationClient:
             f"arc_service.communication.{service_id}"
         )
         self.rpc_bindings = dict(rpc_bindings or {})
+        self.stream_bindings = dict(stream_bindings or {})
         self.event_bindings = dict(event_bindings or {})
 
         self.services = ServiceDirectory(self)
@@ -440,7 +610,9 @@ class CommunicationClient:
         self._writer: asyncio.StreamWriter | None = None
         self._send_lock = asyncio.Lock()
         self._pending: dict[str, asyncio.Future[dict[str, Any]]] = {}
+        self._streams: dict[str, _PendingStream] = {}
         self._event_tasks: dict[str, asyncio.Task[None]] = {}
+        self._stream_tasks: dict[str, asyncio.Task[None]] = {}
         self._reader_task: asyncio.Task[None] | None = None
         self._hello_future: asyncio.Future[dict[str, Any]] | None = None
         self._closed = False
@@ -473,7 +645,7 @@ class CommunicationClient:
             await self._send(
                 Hello(
                     service_id=self.service_id,
-                    rpc_methods=sorted(self.rpc_bindings),
+                    rpc_methods=sorted(set(self.rpc_bindings) | set(self.stream_bindings)),
                     subscriptions=sorted(self.event_bindings),
                 )
             )
@@ -502,6 +674,21 @@ class CommunicationClient:
         if self._event_tasks:
             await asyncio.gather(*self._event_tasks.values(), return_exceptions=True)
         self._event_tasks.clear()
+
+        for task in list(self._stream_tasks.values()):
+            task.cancel()
+        if self._stream_tasks:
+            await asyncio.gather(*self._stream_tasks.values(), return_exceptions=True)
+        self._stream_tasks.clear()
+
+        for pending_stream in self._streams.values():
+            pending_stream.queue.put_nowait(
+                _StreamFinished(
+                    ok=False,
+                    error="ARC communication connection closed",
+                    error_type="COMMUNICATION_UNAVAILABLE",
+                )
+            )
 
         if (
             self._reader_task is not None
@@ -577,6 +764,62 @@ class CommunicationClient:
         finally:
             self._pending.pop(request_id, None)
 
+    async def _stream(
+        self,
+        service_id: str,
+        method: str,
+        request: BaseModel,
+        *,
+        idle_timeout: float | None,
+    ) -> AsyncIterator[Any]:
+        request_id = str(uuid.uuid4())
+        pending = _PendingStream()
+        self._streams[request_id] = pending
+        request_sent = False
+        completed = False
+
+        try:
+            await self._send(
+                RpcStreamCall(
+                    id=request_id,
+                    target=service_id,
+                    method=method,
+                    payload=request.model_dump(mode="json"),
+                )
+            )
+            request_sent = True
+
+            while True:
+                try:
+                    if idle_timeout is None:
+                        item = await pending.queue.get()
+                    else:
+                        async with asyncio.timeout(idle_timeout):
+                            item = await pending.queue.get()
+                except TimeoutError as exc:
+                    raise RpcTimeoutError(
+                        f"RPC stream {service_id!r}.{method} produced no item "
+                        f"for {idle_timeout:.2f}s"
+                    ) from exc
+
+                if isinstance(item, _StreamFinished):
+                    completed = True
+                    if not item.ok:
+                        error = item.error or "Remote stream failed"
+                        if item.error_type == "SERVICE_UNAVAILABLE":
+                            raise ServiceUnavailableError(error)
+                        raise RemoteCallError(error)
+                    return
+
+                yield item
+        finally:
+            self._streams.pop(request_id, None)
+            if request_sent and not completed and not self._closed and self._writer is not None:
+                try:
+                    await self._send(RpcStreamCancel(id=request_id))
+                except CommunicationError:
+                    pass
+
     async def _read_loop(self) -> None:
         assert self._reader is not None
         try:
@@ -623,6 +866,40 @@ class CommunicationClient:
                     future = self._pending.get(request_id)
                     if future is not None and not future.done():
                         future.set_result(message)
+                elif message_type == "rpc_stream_item":
+                    message = RpcStreamItem.model_validate(message).model_dump(mode="python")
+                    pending_stream = self._streams.get(message["id"])
+                    if pending_stream is not None:
+                        pending_stream.queue.put_nowait(message["payload"])
+                elif message_type == "rpc_stream_end":
+                    message = RpcStreamEnd.model_validate(message).model_dump(mode="python")
+                    pending_stream = self._streams.get(message["id"])
+                    if pending_stream is not None:
+                        pending_stream.queue.put_nowait(
+                            _StreamFinished(
+                                ok=message["ok"],
+                                error=message.get("error"),
+                                error_type=message.get("error_type"),
+                            )
+                        )
+                elif message_type == "rpc_stream_request":
+                    message = RpcStreamRequest.model_validate(message).model_dump(mode="python")
+                    call_id = message["id"]
+                    if call_id in self._stream_tasks:
+                        raise ProtocolError(f"Duplicate stream request ID: {call_id}")
+                    task = asyncio.create_task(
+                        self._execute_rpc_stream(message),
+                        name=f"arc-rpc-stream:{self.service_id}:{call_id}",
+                    )
+                    self._stream_tasks[call_id] = task
+                    task.add_done_callback(
+                        lambda done, key=call_id: self._stream_tasks.pop(key, None)
+                    )
+                elif message_type == "rpc_stream_cancel":
+                    message = RpcStreamCancel.model_validate(message).model_dump(mode="python")
+                    task = self._stream_tasks.get(message["id"])
+                    if task is not None and not task.done():
+                        task.cancel()
                 elif message_type == "rpc_request":
                     message = RpcRequest.model_validate(message).model_dump(
                         mode="python"
@@ -663,6 +940,14 @@ class CommunicationClient:
                                 f"Communication connection lost: {exc}"
                             )
                         )
+                for pending_stream in self._streams.values():
+                    pending_stream.queue.put_nowait(
+                        _StreamFinished(
+                            ok=False,
+                            error=f"Communication connection lost: {exc}",
+                            error_type="COMMUNICATION_UNAVAILABLE",
+                        )
+                    )
                 if self._hello_future is not None and not self._hello_future.done():
                     self._hello_future.set_exception(
                         CommunicationUnavailableError(f"Handshake failed: {exc}")
@@ -705,6 +990,57 @@ class CommunicationClient:
                         id=str(call_id),
                         ok=False,
                         error=f"{type(exc).__name__}: {exc}",
+                        error_type=type(exc).__name__,
+                    )
+                )
+            except CommunicationError:
+                pass
+
+    async def _execute_rpc_stream(self, message: dict[str, Any]) -> None:
+        call_id = str(message["id"])
+        method_name = str(message["method"])
+        binding = self.stream_bindings.get(method_name)
+
+        if binding is None:
+            await self._send(
+                RpcStreamEnd(
+                    id=call_id,
+                    ok=False,
+                    error=(
+                        f"RPC stream method {method_name!r} is not exposed "
+                        f"by service {self.service_id!r}"
+                    ),
+                    error_type="RPC_METHOD_NOT_FOUND",
+                )
+            )
+            return
+
+        try:
+            request = binding.request_model.model_validate(message.get("payload"))
+            result = binding.handler(request)
+            if inspect.isawaitable(result):
+                result = await result
+            if not isinstance(result, AsyncIterable):
+                raise TypeError(
+                    f"RPC stream method {method_name!r} must return an AsyncIterable"
+                )
+
+            async for event in result:
+                validated = binding.event_adapter.validate_python(event)
+                payload = binding.event_adapter.dump_python(validated, mode="json")
+                await self._send(RpcStreamItem(id=call_id, payload=payload))
+
+            await self._send(RpcStreamEnd(id=call_id, ok=True))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.logger.exception("RPC stream method %s failed", method_name)
+            try:
+                await self._send(
+                    RpcStreamEnd(
+                        id=call_id,
+                        ok=False,
+                        error=f"{type(exc).__name__}: {exc}"[:2048],
                         error_type=type(exc).__name__,
                     )
                 )

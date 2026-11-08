@@ -14,6 +14,7 @@ from .communication import (
     ServiceUnavailableError,
     event_handler,
     rpc_method,
+    rpc_stream,
 )
 from .context import BaseContext
 from .service import Service, ServiceInfo
@@ -47,4 +48,5 @@ __all__ = [
     "ServiceUnavailableError",
     "event_handler",
     "rpc_method",
+    "rpc_stream",
 ]

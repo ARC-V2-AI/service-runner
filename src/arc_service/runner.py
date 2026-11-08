@@ -86,12 +86,13 @@ async def run_service(
     try:
         service_class = resolve_service_class(module_path)
         service = service_class()
-        rpc_bindings, event_bindings = discover_bindings(service)
+        rpc_bindings, stream_bindings, event_bindings = discover_bindings(service)
 
         communication = CommunicationClient(
             service_id=service_name,
             logger=logging.getLogger(f"{service_name}.communication"),
             rpc_bindings=rpc_bindings,
+            stream_bindings=stream_bindings,
             event_bindings=event_bindings,
         )
         await communication.connect()
